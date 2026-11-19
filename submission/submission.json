@@ -1,12 +1,12 @@
 {
-  "team": "",
-  "members": [],
-  "incident": "",
-  "decision_v1": "",
-  "decision_v2": "",
+  "team": "K5-L3B-DAY10-Muller-PoCtoPilotGate1",
+  "members": ["VuNgocTung-2A202604106"],
+  "incident": "S1",
+  "decision_v1": "Thu hẹp",
+  "decision_v2": "Tiếp tục",
   "three_lines": {
-    "environment_assumption": "",
-    "reduce_or_prevent": "",
-    "measure_in_pilot": ""
+    "environment_assumption": "Đội giả định khi điểm phát đã ghi `delivered_date` và `delay_cause` thì hai trường đó đúng; thẻ S1 cho thấy chúng có thể trống dù hàng đã giao (O-2120, O-2121), và ngoài thực tế còn có thể bị nhập bù sai ngày, khi đó cổng vẫn tin tracking.",
+    "reduce_or_prevent": "Cổng NGĂN được lỗi oan do số khách khai và do tracking thiếu dữ liệu (tính lại mọi số từ tracking, dữ liệu thiếu thì chuyển người; S1 lỗi oan 15 → 0), nhưng chỉ GIẢM nguy cơ hãng nhỏ bị ngưng tuyến vì trần 2 lỗi/hãng/ngày chưa nhìn cửa sổ 3 lỗi/7 ngày của hợp đồng và không thấy tracking ghi sai.",
+    "measure_in_pilot": "Đo tỉ lệ kiện DELIVERED thiếu hoặc sai `delivered_date` so với chữ ký giao của hãng, số lỗi mỗi hãng trong 7 ngày (`max_faults_per_carrier_day` cộng dồn) cùng số khiếu nại hãng được xác nhận, và thời gian chờ thật của NV-HANH khi tỉ lệ chuyển người lên khoảng 38% như trên gói S1."
   }
 }

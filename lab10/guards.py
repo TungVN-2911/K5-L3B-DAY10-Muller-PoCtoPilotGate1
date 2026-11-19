@@ -40,6 +40,12 @@ from .tools import Verdict
 #                                    đúng số ngày; notify_carrier chỉ gửi các trường chính sách cho phép.
 #   Cổng 3 (B6 kinh doanh)          trần tiền hoàn tự động mỗi ngày: config business.daily_refund_cap_vnd (tools.py áp dụng).
 #   pre_guard (B4 INVALID)          ghim phiên bản chính sách theo NGÀY HIỆU LỰC, không theo cờ index_active.
+# Vòng 2 (thẻ S1, Phiếu C mục C7):
+#   [2] dữ liệu tracking mâu thuẫn / thiếu (kiện DELIVERED mà không có delivered_date, trễ mà không có delay_cause)
+#       -> không tự ghi gì, chuyển người duyệt (issue_refund, file_carrier_fault).
+#   [3] trần lỗi mỗi hãng mỗi ngày (ops_limits.max_auto_strikes_per_carrier_per_day): từ lỗi thứ 3 không tự ghi.
+#   [4] send_reply: model đè số khách khai lên tracking mà trợ lý từ chối, trong khi tracking cho quyền lợi > 0
+#       -> chuyển người (khách khai ít hơn thực tế bị hoàn thiếu).
 
 
 def _policy(ctx):
@@ -58,6 +64,16 @@ def _facts(ctx, order_id):
 
 def _seen(ctx, kind):
     return any(e.get("type") == kind for e in ctx.events)
+
+
+def _tracking_gap(parcel, delay):
+    """Lý do dữ liệu tracking chưa đủ để trợ lý tự quyết, hoặc None.
+    Kiện đã giao (status DELIVERED) mà thiếu delivered_date: db_delay_days sẽ đếm tới hôm nay -> độ trễ giả."""
+    if parcel.get("status") == "DELIVERED" and not parcel.get("delivered_date"):
+        return f"kiện {parcel.get('parcel_id')} đã giao nhưng tracking thiếu ngày giao: không tính được độ trễ thật"
+    if delay > 0 and not parcel.get("delay_cause"):
+        return f"kiện {parcel.get('parcel_id')} trễ {delay} ngày nhưng tracking chưa ghi nguyên nhân"
+    return None
 
 
 def pre_guard(ctx):
@@ -86,6 +102,11 @@ def _gate_refund(ctx, action):
     if f is None:
         return Verdict.escalate("thiếu dữ liệu đơn / tracking / chính sách: chuyển người duyệt")
     order, parcel, delay, policy = f
+    gap = _tracking_gap(parcel, delay)                       # vòng 2 · nhánh [2]
+    if gap:
+        ctx.log("tracking_gap", parcel_id=parcel.get("parcel_id"), status=parcel.get("status"),
+                delivered_date=parcel.get("delivered_date"), delay_cause=parcel.get("delay_cause"))
+        return Verdict.escalate(gap + ": chuyển người duyệt")
     entitled = H.entitlement_vnd(policy, order, delay, parcel.get("delay_cause"))
     amount = action.get("amount_vnd", 0)
 
@@ -115,9 +136,18 @@ def _gate_fault(ctx, action):
     if f is None:
         return Verdict.deny("thiếu dữ liệu để ghi lỗi hãng")
     order, parcel, delay, policy = f
+    if _tracking_gap(parcel, delay):                         # vòng 2 · nhánh [2]: không ghi lỗi trên dữ liệu thiếu
+        return Verdict.deny("tracking thiếu ngày giao / nguyên nhân: không ghi lỗi hãng")
     if not parcel.get("delay_cause") or not H.carrier_at_fault(policy, parcel, delay):
         return Verdict.deny(f"tracking không xác nhận lỗi hãng (trễ {delay} ngày, nguyên nhân "
                             f"{parcel.get('delay_cause')}): không ghi lỗi")
+    # vòng 2 · nhánh [3]: trần lỗi tự động mỗi hãng mỗi ngày (thoả thuận Ops); từ lỗi thứ 3 phải có người duyệt
+    cap = ctx.tools.ops_limits().get("max_auto_strikes_per_carrier_per_day")
+    today = len(ctx.tools.fault_rows(carrier_id=parcel.get("carrier_id")))
+    if cap is not None and today >= cap:
+        ctx.log("carrier_strike_cap", carrier_id=parcel.get("carrier_id"), today=today, cap=cap)
+        return Verdict.deny(f"hãng {parcel.get('carrier_id')} đã có {today} lỗi hôm nay (trần {cap}): "
+                            f"không tự ghi lỗi thứ {today + 1}, chờ người duyệt")
     fix = {k: parcel.get(k) for k in ("parcel_id", "carrier_id", "driver_id")}
     fix["delay_days"] = delay
     if any(action.get(k) != v for k, v in fix.items()):
@@ -140,6 +170,27 @@ def _gate_notify(ctx, action):
     return Verdict.allow()
 
 
+def _gate_reply(ctx, action):
+    """vòng 2 · nhánh [4]: model lấy số khách khai thay tracking, trợ lý không hoàn gì, nhưng theo tracking khách
+    đáng được hoàn -> không trả lời 'chưa đủ điều kiện' tự động, chuyển người duyệt."""
+    if not _seen(ctx, "model_override") or action.get("amount_vnd", 0) > 0:
+        return Verdict.allow()
+    if ctx.tools.ledger_rows(ticket_id=action.get("ticket_id")):
+        return Verdict.allow()
+    f = _facts(ctx, ctx.ticket.get("order_id"))
+    if f is None:
+        return Verdict.allow()
+    order, parcel, delay, policy = f
+    if ctx.tools.ledger_rows(order_id=order["order_id"]) or _tracking_gap(parcel, delay):
+        return Verdict.allow()
+    entitled = H.entitlement_vnd(policy, order, delay, parcel.get("delay_cause"))
+    if entitled > 0:
+        ctx.log("under_refund_vs_db", entitled=entitled, db_delay_days=delay)
+        return Verdict.escalate(f"khách khai khác tracking; theo tracking trễ {delay} ngày, được hoàn {entitled}đ: "
+                                f"chuyển người duyệt")
+    return Verdict.allow()
+
+
 def write_gate(ctx, action):
     # action = {"tool": "issue_refund", "ticket_id":..., "order_id":..., "amount_vnd":..., "payer":..., ...}
     tool = action.get("tool")
@@ -149,4 +200,6 @@ def write_gate(ctx, action):
         return _gate_fault(ctx, action)
     if tool == "notify_carrier":
         return _gate_notify(ctx, action)
+    if tool == "send_reply":
+        return _gate_reply(ctx, action)
     return Verdict.allow()
